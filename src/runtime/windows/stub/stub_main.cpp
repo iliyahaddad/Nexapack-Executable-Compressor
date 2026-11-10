@@ -1,0 +1,539 @@
+// NexaPack Windows PE Runtime Stub
+// Compiled as a standalone PE, embedded into packed executables.
+// The stub: reads its own file, parses NXP metadata, decompresses the
+// payload (Store / ZSTD / LZ4), reconstructs the original PE image in
+// memory, resolves imports and relocations, then transfers execution to
+// the original entry point.
+//
+// Layout expected in the packed file:
+//   [stub PE][NXP metadata (108 bytes)][compressed payload][8-byte footer: metadata_offset]
+//
+// No temporary executable is written to disk. Execution is in-memory.
+
+#define UNICODE
+#define _UNICODE
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <stdint.h>
+#include <windows.h>
+#include <stdio.h>
+#include <cstdlib>
+
+#include "zstd.h"
+#include "lz4.h"
+#include "LzmaDec.h"
+
+// Simple malloc/free allocator for LZMA SDK in the stub.
+static void* SzAllocStub(ISzAllocPtr p, size_t size) { return std::malloc(size); }
+static void SzFreeStub(ISzAllocPtr p, void* address) { std::free(address); }
+static const ISzAlloc g_Alloc = { SzAllocStub, SzFreeStub };
+
+//-----------------------------------------------------------------------------
+// Minimal PE structures (self-contained).
+//-----------------------------------------------------------------------------
+
+#pragma pack(push, 1)
+typedef struct _NX_DOS_HEADER {
+    char   e_magic[2];
+    uint16_t e_cblp, e_cp, e_crlc, e_cparhdr, e_minalloc, e_maxalloc;
+    uint16_t e_ss, e_sp, e_csum, e_ip, e_cs, e_lfarlc, e_ovno;
+    uint16_t e_res[4], e_oemid, e_oeminfo, e_res2[10];
+    uint32_t e_lfanew;
+} NX_DOS_HEADER;
+
+typedef struct _NX_FILE_HEADER {
+    uint16_t Machine, NumberOfSections;
+    uint32_t TimeDateStamp, PointerToSymbolTable, NumberOfSymbols;
+    uint16_t SizeOfOptionalHeader, Characteristics;
+} NX_FILE_HEADER;
+
+typedef struct _NX_OPTIONAL_HEADER64 {
+    uint16_t Magic;
+    uint8_t  MajorLinkerVersion, MinorLinkerVersion;
+    uint32_t SizeOfCode, SizeOfInitializedData, SizeOfUninitializedData;
+    uint32_t AddressOfEntryPoint, BaseOfCode;
+    uint64_t ImageBase;
+    uint32_t SectionAlignment, FileAlignment;
+    uint16_t MajorOperatingSystemVersion, MinorOperatingSystemVersion;
+    uint16_t MajorImageVersion, MinorImageVersion;
+    uint16_t MajorSubsystemVersion, MinorSubsystemVersion;
+    uint32_t Win32VersionValue, SizeOfImage, SizeOfHeaders, CheckSum;
+    uint16_t Subsystem, DllCharacteristics;
+    uint64_t SizeOfStackReserve, SizeOfStackCommit;
+    uint64_t SizeOfHeapReserve, SizeOfHeapCommit;
+    uint32_t LoaderFlags, NumberOfRvaAndSizes;
+} NX_OPTIONAL_HEADER64;
+
+typedef struct _NX_DATA_DIRECTORY { uint32_t VirtualAddress, Size; } NX_DATA_DIRECTORY;
+
+typedef struct _NX_SECTION_HEADER {
+    char Name[8];
+    uint32_t VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData;
+    uint32_t PointerToRelocations, PointerToLinenumbers;
+    uint16_t NumberOfRelocations, NumberOfLinenumbers;
+    uint32_t Characteristics;
+} NX_SECTION_HEADER;
+
+typedef struct _NX_IMPORT_DESCRIPTOR {
+    uint32_t OriginalFirstThunk, TimeDateStamp, ForwarderChain, Name, FirstThunk;
+} NX_IMPORT_DESCRIPTOR;
+
+typedef struct _NX_BASE_RELOCATION { uint32_t VirtualAddress, SizeOfBlock; } NX_BASE_RELOCATION;
+
+typedef struct _NX_SECTION_ENCRYPTION {
+    uint32_t section_index;
+    uint64_t xor_key;
+} NX_SECTION_ENCRYPTION;
+#pragma pack(pop)
+
+#define NX_NT_SIGNATURE 0x00004550
+#define NX_DIR_IMPORT 1
+#define NX_DIR_BASERELOC 5
+#define NX_REL_DIR64 10
+#define NX_REL_HIGHLOW 3
+
+//-----------------------------------------------------------------------------
+// NXP metadata
+//-----------------------------------------------------------------------------
+
+#pragma pack(push, 1)
+typedef struct _NX_META_HEADER {
+    char     magic[4];
+    uint32_t version, runtime_abi_version, target_format, architecture, codec_id;
+    uint32_t compression_settings;
+    uint64_t original_file_size, payload_size, stub_size;
+    uint64_t metadata_offset, metadata_size, payload_offset;
+    uint64_t stub_offset, integrity_offset, integrity_size;
+    uint32_t checksum, reserved;
+    uint32_t num_encrypted_sections;
+} NX_META_HEADER;
+#pragma pack(pop)
+
+#define NX_MAGIC "NXP\0"
+#define NX_META_VERSION 2  // Bumped due to section encryption support
+#define NX_CODEC_STORE 1
+#define NX_CODEC_ZSTD 2
+#define NX_CODEC_LZ4 3
+#define NX_CODEC_LZMA 4
+
+//-----------------------------------------------------------------------------
+// Helpers
+//-----------------------------------------------------------------------------
+
+static uint64_t rd64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= ((uint64_t)p[i]) << (8 * i);
+    return v;
+}
+
+static uint32_t rd32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Decrypt a section using XOR with a repeating key derived from seed.
+// The key is generated by xorshift32 PRNG seeded with the provided seed.
+static void decrypt_section(uint8_t* data, size_t size, uint64_t seed) {
+    uint32_t s = (uint32_t)seed;
+    for (size_t i = 0; i < size; i++) {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        data[i] ^= static_cast<uint8_t>(s & 0xFF);
+    }
+}
+
+// Read entire own file into allocated buffer.
+static uint8_t* read_own_file(size_t* out_size) {
+    wchar_t path[MAX_PATH];
+    if (GetModuleFileNameW(NULL, path, MAX_PATH) == 0) return NULL;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER fsize;
+    if (!GetFileSizeEx(h, &fsize)) { CloseHandle(h); return NULL; }
+    if (fsize.QuadPart == 0 || fsize.QuadPart > (1ull << 40)) {
+        CloseHandle(h);
+        return NULL;
+    }
+    uint8_t* buf = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)fsize.QuadPart,
+                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buf) { CloseHandle(h); return NULL; }
+    DWORD read = 0;
+    if (!ReadFile(h, buf, (DWORD)fsize.QuadPart, &read, NULL) || read != fsize.QuadPart) {
+        VirtualFree(buf, 0, MEM_RELEASE);
+        CloseHandle(h);
+        return NULL;
+    }
+    CloseHandle(h);
+    *out_size = fsize.QuadPart;
+    return buf;
+}
+
+// Map RVA to in-memory pointer using section table.
+static uint8_t* rva_to_ptr(uint8_t* image_base, const NX_FILE_HEADER* fh,
+                           const NX_SECTION_HEADER* sec, uint32_t rva) {
+    for (uint16_t i = 0; i < fh->NumberOfSections; i++) {
+        if (rva >= sec[i].VirtualAddress &&
+            rva < sec[i].VirtualAddress + sec[i].VirtualSize) {
+            return image_base + sec[i].VirtualAddress + (rva - sec[i].VirtualAddress);
+        }
+    }
+    return NULL;
+}
+
+// Apply base relocations.
+static bool apply_relocations(uint8_t* image, uint64_t delta,
+                              const uint8_t* pe_buf) {
+    const NX_DOS_HEADER* dos = (const NX_DOS_HEADER*)pe_buf;
+    const uint8_t* nt = pe_buf + dos->e_lfanew;
+    const NX_FILE_HEADER* fh = (const NX_FILE_HEADER*)(nt + 4);
+    const NX_OPTIONAL_HEADER64* oh =
+        (const NX_OPTIONAL_HEADER64*)(nt + 4 + sizeof(NX_FILE_HEADER));
+    const NX_DATA_DIRECTORY* dirs =
+        (const NX_DATA_DIRECTORY*)((const uint8_t*)oh +
+                                   sizeof(NX_OPTIONAL_HEADER64));
+    const NX_DATA_DIRECTORY* reloc = &dirs[NX_DIR_BASERELOC];
+    if (reloc->Size == 0 || reloc->VirtualAddress == 0) return true;
+
+    const NX_SECTION_HEADER* sec =
+        (const NX_SECTION_HEADER*)((const uint8_t*)oh +
+                                   sizeof(NX_OPTIONAL_HEADER64) +
+                                   oh->NumberOfRvaAndSizes * sizeof(NX_DATA_DIRECTORY));
+
+    uint8_t* reloc_start = rva_to_ptr(image, fh, sec, reloc->VirtualAddress);
+    if (!reloc_start) return false;
+
+    uint32_t end = reloc->VirtualAddress + reloc->Size;
+    uint32_t cur = reloc->VirtualAddress;
+    while (cur < end) {
+        const NX_BASE_RELOCATION* block =
+            (const NX_BASE_RELOCATION*)(reloc_start + (cur - reloc->VirtualAddress));
+        uint32_t count = (block->SizeOfBlock - sizeof(NX_BASE_RELOCATION)) / 2;
+        const uint16_t* entries = (const uint16_t*)(block + 1);
+        uint8_t* block_base = rva_to_ptr(image, fh, sec, block->VirtualAddress);
+        if (!block_base) return false;
+        for (uint32_t i = 0; i < count; i++) {
+            uint16_t entry = entries[i];
+            uint32_t type = entry >> 12, off = entry & 0xFFF;
+            if (type == NX_REL_DIR64) {
+                *(uint64_t*)(block_base + off) += delta;
+            } else if (type == NX_REL_HIGHLOW) {
+                *(uint32_t*)(block_base + off) += (uint32_t)delta;
+            }
+        }
+        cur += block->SizeOfBlock;
+    }
+    return true;
+}
+
+// Resolve imports.
+static bool resolve_imports(uint8_t* image, const uint8_t* pe_buf) {
+    const NX_DOS_HEADER* dos = (const NX_DOS_HEADER*)pe_buf;
+    const uint8_t* nt = pe_buf + dos->e_lfanew;
+    const NX_FILE_HEADER* fh = (const NX_FILE_HEADER*)(nt + 4);
+    const NX_OPTIONAL_HEADER64* oh =
+        (const NX_OPTIONAL_HEADER64*)(nt + 4 + sizeof(NX_FILE_HEADER));
+    const NX_DATA_DIRECTORY* dirs =
+        (const NX_DATA_DIRECTORY*)((const uint8_t*)oh +
+                                   sizeof(NX_OPTIONAL_HEADER64));
+    const NX_DATA_DIRECTORY* imp = &dirs[NX_DIR_IMPORT];
+    if (imp->Size == 0 || imp->VirtualAddress == 0) return true;
+
+    const NX_SECTION_HEADER* sec =
+        (const NX_SECTION_HEADER*)((const uint8_t*)oh +
+                                   sizeof(NX_OPTIONAL_HEADER64) +
+                                   oh->NumberOfRvaAndSizes * sizeof(NX_DATA_DIRECTORY));
+
+    uint8_t* imp_start = rva_to_ptr(image, fh, sec, imp->VirtualAddress);
+    if (!imp_start) return false;
+
+    uint32_t end = imp->VirtualAddress + imp->Size;
+    uint32_t cur = imp->VirtualAddress;
+    while (cur < end) {
+        const NX_IMPORT_DESCRIPTOR* desc =
+            (const NX_IMPORT_DESCRIPTOR*)(imp_start + (cur - imp->VirtualAddress));
+        if (desc->Name == 0) break;
+        const char* dll_name = (const char*)rva_to_ptr(image, fh, sec, desc->Name);
+        if (!dll_name) return false;
+        HMODULE hmod = LoadLibraryA(dll_name);
+        if (!hmod) return false;
+        uint8_t* iat = rva_to_ptr(image, fh, sec, desc->FirstThunk);
+        uint8_t* ilt = rva_to_ptr(image, fh, sec, desc->OriginalFirstThunk);
+        if (!iat) return false;
+        if (!ilt) ilt = iat;
+        uint32_t idx = 0;
+        while (true) {
+            uint64_t thunk = rd64(ilt + idx * 8);
+            if (thunk == 0) break;
+            uint8_t* addr = iat + idx * 8;
+            if (thunk & 0x8000000000000000ull) {
+                FARPROC proc = GetProcAddress(hmod, (LPCSTR)(uintptr_t)(uint16_t)thunk);
+                if (!proc) return false;
+                *(uint64_t*)addr = (uint64_t)(uintptr_t)proc;
+            } else {
+                const char* name = (const char*)rva_to_ptr(image, fh, sec, (uint32_t)thunk);
+                if (!name) return false;
+                name += 2; // skip hint
+                FARPROC proc = GetProcAddress(hmod, name);
+                if (!proc) return false;
+                *(uint64_t*)addr = (uint64_t)(uintptr_t)proc;
+            }
+            idx++;
+        }
+        cur += sizeof(NX_IMPORT_DESCRIPTOR);
+    }
+    return true;
+}
+
+// Decompress payload using the appropriate codec.
+static bool decompress_payload(const uint8_t* payload, uint64_t payload_size,
+                               uint32_t codec_id, uint64_t expected_size,
+                               uint8_t** out_buf, uint64_t* out_size) {
+    if (codec_id == NX_CODEC_STORE) {
+        *out_buf = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)expected_size,
+                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!*out_buf) return false;
+        memcpy(*out_buf, payload, (size_t)expected_size);
+        *out_size = expected_size;
+        return true;
+    }
+
+    if (codec_id == NX_CODEC_ZSTD) {
+        long long content_size = ZSTD_getFrameContentSize(payload, payload_size);
+        if (content_size < 0) return false;
+        uint64_t out_sz = (expected_size != 0) ? expected_size
+                                               : (uint64_t)content_size;
+        uint8_t* out = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)out_sz,
+                                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!out) return false;
+        size_t rc = ZSTD_decompress(out, out_sz, payload, payload_size);
+        if (ZSTD_isError(rc)) {
+            VirtualFree(out, 0, MEM_RELEASE);
+            return false;
+        }
+        *out_buf = out;
+        *out_size = rc;
+        return true;
+    }
+
+    if (codec_id == NX_CODEC_LZ4) {
+        // LZ4_decompress_safe requires the expected output size.
+        if (expected_size == 0) return false;
+        uint8_t* out = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)expected_size,
+                                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!out) return false;
+        int rc = LZ4_decompress_safe((const char*)payload, (char*)out,
+                                     (int)payload_size, (int)expected_size);
+        if (rc < 0) {
+            VirtualFree(out, 0, MEM_RELEASE);
+            return false;
+        }
+        *out_buf = out;
+        *out_size = (uint64_t)rc;
+        return true;
+    }
+
+    if (codec_id == NX_CODEC_LZMA) {
+        if (payload_size < LZMA_PROPS_SIZE) return false;
+        CLzmaProps props;
+        SRes res = LzmaProps_Decode(&props,
+                                    reinterpret_cast<const Byte*>(payload),
+                                    LZMA_PROPS_SIZE);
+        if (res != SZ_OK) return false;
+
+        CLzmaDec dec;
+        LzmaDec_Construct(&dec);
+        res = LzmaDec_Allocate(&dec,
+                               reinterpret_cast<const Byte*>(payload),
+                               LZMA_PROPS_SIZE, &g_Alloc);
+        if (res != SZ_OK) return false;
+
+        LzmaDec_Init(&dec);
+
+        SizeT lzma_out_size = static_cast<SizeT>(expected_size);
+        uint8_t* out = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)lzma_out_size,
+                                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!out) {
+            LzmaDec_Free(&dec, &g_Alloc);
+            return false;
+        }
+
+        const Byte* src = payload + LZMA_PROPS_SIZE;
+        SizeT src_size = static_cast<SizeT>(payload_size) - LZMA_PROPS_SIZE;
+        ELzmaStatus status;
+        res = LzmaDec_DecodeToBuf(&dec, out, &lzma_out_size, src, &src_size,
+                                  LZMA_FINISH_ANY, &status);
+
+        bool ok = (res == SZ_OK);
+        if (!ok) {
+            VirtualFree(out, 0, MEM_RELEASE);
+            LzmaDec_Free(&dec, &g_Alloc);
+            return false;
+        }
+
+        LzmaDec_Free(&dec, &g_Alloc);
+        *out_buf = out;
+        *out_size = lzma_out_size;
+        return true;
+    }
+
+    return false; // unsupported codec
+}
+
+// Set section memory protections.
+static void set_protections(uint8_t* image, const NX_FILE_HEADER* fh,
+                            const NX_SECTION_HEADER* sec) {
+    for (uint16_t i = 0; i < fh->NumberOfSections; i++) {
+        DWORD prot = PAGE_READONLY;
+        uint32_t c = sec[i].Characteristics;
+        bool exec = (c & 0x80000000) != 0 || (c & 0x20) != 0;
+        bool write = (c & 0x20000000) != 0;
+        bool read = (c & 0x40000000) != 0;
+        bool is_data = (c & 0x40) != 0 || (c & 0x80) != 0;
+        if (is_data) write = true;
+        if (exec && write && read) prot = PAGE_EXECUTE_READWRITE;
+        else if (exec && read) prot = PAGE_EXECUTE_READ;
+        else if (exec) prot = PAGE_EXECUTE_READ;
+        else if (write && read) prot = PAGE_READWRITE;
+        else if (write) prot = PAGE_READWRITE;
+        else if (read) prot = PAGE_READONLY;
+        DWORD old = 0;
+        VirtualProtect(image + sec[i].VirtualAddress, sec[i].VirtualSize, prot, &old);
+    }
+}
+
+//-----------------------------------------------------------------------------
+// Entry
+//-----------------------------------------------------------------------------
+
+typedef int (__stdcall *EntryPoint)(void);
+
+int main() {
+    size_t file_size = 0;
+    uint8_t* file = read_own_file(&file_size);
+    if (!file || file_size < sizeof(NX_META_HEADER) + 8) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+
+    // Footer: last 8 bytes = metadata offset
+    uint64_t meta_off = rd64(file + file_size - 8);
+    if (meta_off >= file_size) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+
+    const NX_META_HEADER* meta = (const NX_META_HEADER*)(file + meta_off);
+    if (memcmp(meta->magic, NX_MAGIC, 4) != 0 ||
+        meta->version != NX_META_VERSION) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+    if (meta->codec_id != NX_CODEC_STORE &&
+        meta->codec_id != NX_CODEC_ZSTD &&
+        meta->codec_id != NX_CODEC_LZ4 &&
+        meta->codec_id != NX_CODEC_LZMA) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+    if (meta->payload_offset >= file_size ||
+        meta->payload_size > file_size - meta->payload_offset) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+
+    const uint8_t* payload = file + meta->payload_offset;
+    uint64_t pe_size = meta->payload_size;
+
+    // Decompress payload using the appropriate codec
+    uint8_t* pe_buf_alloc = NULL;
+    const uint8_t* pe_buf = payload;
+    if (!decompress_payload(payload, meta->payload_size, meta->codec_id,
+                            meta->original_file_size, &pe_buf_alloc, &pe_size)) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+    if (pe_buf_alloc) pe_buf = pe_buf_alloc;
+
+    if (pe_size < sizeof(NX_DOS_HEADER) || memcmp(pe_buf, "MZ", 2) != 0) {
+        if (pe_buf_alloc) VirtualFree(pe_buf_alloc, 0, MEM_RELEASE);
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+    const NX_DOS_HEADER* dos = (const NX_DOS_HEADER*)pe_buf;
+    if (pe_size < (size_t)dos->e_lfanew + 4 + sizeof(NX_FILE_HEADER)) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+    const uint8_t* nt = pe_buf + dos->e_lfanew;
+    if (memcmp(nt, "PE\0\0", 4) != 0) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+    const NX_FILE_HEADER* fh = (const NX_FILE_HEADER*)(nt + 4);
+    const NX_OPTIONAL_HEADER64* oh =
+        (const NX_OPTIONAL_HEADER64*)(nt + 4 + sizeof(NX_FILE_HEADER));
+    if (oh->Magic != 0x20b) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+
+    uint8_t* image = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)oh->SizeOfImage,
+                                            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!image) {
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+
+    memcpy(image, pe_buf, oh->SizeOfHeaders);
+
+    const NX_SECTION_HEADER* sec =
+        (const NX_SECTION_HEADER*)((const uint8_t*)oh +
+                                   sizeof(NX_OPTIONAL_HEADER64) +
+                                   oh->NumberOfRvaAndSizes * sizeof(NX_DATA_DIRECTORY));
+    for (uint16_t i = 0; i < fh->NumberOfSections; i++) {
+        if (sec[i].SizeOfRawData == 0) continue;
+        memcpy(image + sec[i].VirtualAddress, pe_buf + sec[i].PointerToRawData,
+               sec[i].SizeOfRawData);
+        if (sec[i].VirtualSize > sec[i].SizeOfRawData) {
+            memset(image + sec[i].VirtualAddress + sec[i].SizeOfRawData, 0,
+                   sec[i].VirtualSize - sec[i].SizeOfRawData);
+        }
+    }
+
+    // Decrypt any protected sections
+    if (meta->num_encrypted_sections > 0) {
+        const uint8_t* enc_data = file + meta_off + sizeof(NX_META_HEADER);
+        for (uint32_t i = 0; i < meta->num_encrypted_sections; i++) {
+            const NX_SECTION_ENCRYPTION* enc =
+                (const NX_SECTION_ENCRYPTION*)(enc_data + i * sizeof(NX_SECTION_ENCRYPTION));
+            if (enc->section_index >= fh->NumberOfSections) continue;
+            uint8_t* sec_data = image + sec[enc->section_index].VirtualAddress;
+            uint32_t sec_size = sec[enc->section_index].SizeOfRawData;
+            decrypt_section(sec_data, sec_size, enc->xor_key);
+        }
+    }
+
+    uint64_t delta = (uint64_t)(image - oh->ImageBase);
+    if (!apply_relocations(image, delta, pe_buf)) {
+        VirtualFree(image, 0, MEM_RELEASE);
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+    if (!resolve_imports(image, pe_buf)) {
+        VirtualFree(image, 0, MEM_RELEASE);
+        VirtualFree(file, 0, MEM_RELEASE);
+        return 1;
+    }
+    set_protections(image, fh, sec);
+
+    EntryPoint ep = (EntryPoint)(image + oh->AddressOfEntryPoint);
+    int result = ep();
+
+    VirtualFree(image, 0, MEM_RELEASE);
+    VirtualFree(file, 0, MEM_RELEASE);
+    if (pe_buf_alloc) VirtualFree(pe_buf_alloc, 0, MEM_RELEASE);
+    return result;
+}

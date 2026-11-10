@@ -1,0 +1,13 @@
+<RCC>
+    <qresource prefix="/qml">
+        <file>main.qml</file>
+        <file>pages/Dashboard.qml</file>
+        <file>pages/Pack.qml</file>
+        <file>pages/Inspect.qml</file>
+        <file>pages/Unpack.qml</file>
+        <file>pages/Benchmark.qml</file>
+        <file>pages/Batch.qml</file>
+        <file>pages/Settings.qml</file>
+        <file>pages/About.qml</file>
+    </qresource>
+</RCC>

@@ -1,0 +1,16 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+<qresource prefix="/">
+    <file>qml/main.qml</file>
+    <file>qml/pages/dashboard.qml</file>
+    <file>qml/pages/pack.qml</file>
+    <file>qml/pages/inspect.qml</file>
+    <file>qml/pages/unpack.qml</file>
+    <file>qml/pages/benchmark.qml</file>
+    <file>qml/pages/batch.qml</file>
+    <file>qml/pages/settings.qml</file>
+    <file>qml/pages/about.qml</file>
+    <file>qml/components/Card.qml</file>
+    <file>qml/components/ProgressCard.qml</file>
+</qresource>
+</RCC>
