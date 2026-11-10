@@ -1,4 +1,4 @@
-# NexaPack
+# NexaPack Executive Packer
 
 Independent executable compression and protection product for Windows PE32+ x64 executables.
 
@@ -135,3 +135,7 @@ NexaPack uses its own on-disk metadata format with magic identifier `NXP\0`, lit
 ```
 
 No temporary executable files are created during execution — the original executable is reconstructed entirely in memory.
+
+## License
+
+See [LICENSE](LICENSE)
